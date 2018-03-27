@@ -1,0 +1,541 @@
+---
+title: "NLP Seminar"
+author: "Forrest Paton, McMaster University"
+date: '2018-03-27'
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+fontsize: 14pt
+---
+
+# Intro
+
+* We're going to explore how to setup and tune a simple classifier using Natural Language processing
+
+* Slides (and code) available here: https://github.com/fpaton
+
+* packages used:
+
+```{r message=F}
+pacman::p_load(twitteR, dplyr, wordcloud, tm, stringr, lubridate,
+               quanteda, prettydoc, knitr, ggplot2, caret, pROC,
+               RColorBrewer, MASS, rBayesianOptimization, xgboost)
+```
+
+* suggested readings: [Guassian Processes in Machine Learning](https://mitpress.mit.edu/books/gaussian-processes-machine-learning), [NLP in Python](http://www.nltk.org/book/)
+
+![NLF](gpml.jpg) ![NLF](nlppy.jpeg)
+
+
+
+```{r echo=F, message = F, include=F, eval=F}
+consumer_key = "x87PdROmDHqHfnjBL9LPdCmzj"
+consumer_secret = "O5DGqLRXF7eQmpqkOEM70lLO8V4COwixNfdOzvgyIHy4LF00xo"
+access_token = "833867352529776640-tv3eAu1piAlUkSN0uqyiJ7nXEGXHaJv"
+access_secret = "tPHllbrWX9sfbB6X2aKqmK3XhtDGx683ZCiz89TN0JPp3"
+
+setup_twitter_oauth(consumer_key, consumer_secret, 
+                    access_token, access_secret)
+```
+
+# Start with example... Twitter data:
+
+Here I'll scrape some tweets from POTUS:
+
+```{r eval=F}
+trump_tweets <- userTimeline("realDonaldTrump", n = 200, includeRts =F) %>%
+                twListToDF()
+
+obama_tweets <- userTimeline("BarackObama", n = 200, includeRts =F) %>%
+                twListToDF()
+```
+
+```{r echo=F}
+load("tweet.RData")
+load("plot1.RData")
+load("xgb_model1.RData")
+load("bayes.RData")
+load("gp.RData")
+```
+
+```{r echo=F}
+
+kable(head( data.frame("TRUMP" = trump_tweets$text[2:3], 
+                       "Obama" = obama_tweets$text[2:3]), caption= "Trump's Tweets"),
+      caption="Couple of rows from data we just scraped")
+```
+
+## Basic Pre processing
+
+We'll do some basic pre processing here and remove all the url links:
+
+```{r }
+trump_tweets$text <- str_replace_all(trump_tweets$text, "https.*", "") 
+
+obama_tweets$text <- str_replace_all(obama_tweets$text, "https.*", "") 
+```
+
+```{r echo=F}
+
+kable(head( data.frame("TRUMP" = trump_tweets$text[2:3], 
+                       "Obama" = obama_tweets$text[2:3]), caption= "Trump's Tweets"))
+```
+
+Looks better, but probably good idea to remove special symbols.. etc
+
+```{r }
+tweets_tokens <- tokens(c(obama_tweets$text, trump_tweets$text), 
+                       what = "word", 
+                       remove_numbers = TRUE, 
+                       remove_punct   = TRUE, 
+                       remove_symbols = TRUE, 
+                       remove_hyphens = TRUE) %>% tokens_tolower()
+```
+
+### StopWords and Stemming
+
+```{r }
+head(stopwords(), n=10) 
+```
+
+Next are stopwords, think about if it makes sense to remove these in your model.
+
+```{r }
+# remove stopwords
+tweets_tokens <- tokens_select(tweets_tokens, stopwords(), selection="remove")
+head(tweets_tokens)[1]
+```
+Next we'll stem the words, definition from Wikipedia:
+
+>In linguistic morphology and information retrieval, stemming is the process of reducing inflected (or sometimes derived) words to their word stem, base or root form—generally a written word form
+
+
+```{r}
+# stem words
+tweets_tokens <- tokens_wordstem(tweets_tokens, language = "english")
+tweets_tokens[1]
+```
+
+
+
+# Some Exploratory Analysis
+Here are each president's top words tweeted (can you guess who's who?)
+
+
+```{r echo=F, message=F}
+cloud_trump_tweets <- trump_tweets
+cloud_trump_tweets$text <- removeWords(trump_tweets$text, stopwords())
+cloud_trump_tweets$text <- str_replace(cloud_trump_tweets$text, "&amp;", "")
+cloud_trump_tweets$text <- str_replace(cloud_trump_tweets$text, "[[:punct:]]", "") %>% 
+                            str_to_lower()
+
+wordCloud <- strsplit(cloud_trump_tweets$text, " ") %>% unlist()
+
+freq <- table(wordCloud)
+pal <- brewer.pal(9, "BuGn")
+pal <- pal[-(1:4)]
+
+# bama 
+cloud_obama <- obama_tweets
+cloud_obama$text <- removeWords(cloud_obama$text, stopwords())
+cloud_obama$text <- str_replace(cloud_obama$text, "&amp;", "")
+cloud_obama$text <- str_replace(cloud_obama$text, "[[:punct:]]", "") %>% 
+                            str_to_lower()
+
+
+wordcloud(names(freq), freq, min.freq = 3,
+      random.color = T,
+      random.order = FALSE, max.words = 30, scale = c(3, 2),
+      colors=pal)
+
+
+wordCloud <- strsplit(cloud_obama$text, " ") %>% unlist()
+freq <- table(wordCloud)
+pal <- brewer.pal(9, "GnBu")
+pal <- pal[-(1:4)]
+
+wordcloud(names(freq), freq, min.freq = 3, random.color = T,
+      random.order = FALSE, max.words = 30, scale = c(3, 2),
+      colors=pal)
+
+```
+
+## What time of day are they tweeting at
+
+```{r echo=F}
+obama_time <- obama_tweets %>% mutate(created = ymd_hms(created),
+                                       hour_w = with_tz(created, "America/New_York"), hour = lubridate::hour(hour_w))
+
+trump_time <- trump_tweets %>% mutate(created = ymd_hms(created),
+                                       hour_w = with_tz(created, "America/New_York"),
+                                       hour = hour(hour_w))
+
+ t <- trump_time %>% dplyr::select(hour) %>% table() %>% data.frame() %>% mutate(User = "Trump") 
+ 
+ o <- obama_time %>% 
+     dplyr::select(hour) %>% table() %>% data.frame() %>% mutate(User = "Obama") 
+ 
+ t_plot <- rbind(t, o) 
+
+plot2 <- ggplot(data = t_plot, aes(x = ., y = Freq, group=User)) + 
+         geom_line(aes(color=User), size=3, alpha=.7) + 
+         ylab("Tweets") + xlab("Hour: Washington Time") +
+         theme_dark() + theme(axis.title=element_text(size=20,face="bold"))
+plot2 
+```
+
+
+
+# Modelling a classifier
+
+We're going to build a model that, given a tweet, will predict whether it came from President Trump or President Obama.
+
+That is we want a model in some general form:
+
+$$
+P(\text{Tweet = Trump}) = f(\bf{X}) + \epsilon
+$$
+Challenges:
+
+* Need feature matrix \bf{X}
+
+* How to model $f()$
+
+* Compute time
+
+
+## Create a feature matrix
+Key Ideas:
+
+* Represent Each Word in a matrix...
+    + cell(i, j) = # of times word appears
+    + all words are equally important
+
+* Represent Each Word as a column in a matrix...
+    + cell(i, j) = inverse document frequency (${idf}_t$)
+
+Where
+
+$${idf}_t = \ln(\frac{N}{df_t})$$
+Defining ${df}_t =$ # of tweets that contain word $t$ and $N$ as the number of tweets then 
+
+    
+```{r }
+model.tokens.dfm    <- dfm(tweets_tokens, tolower=FALSE)
+model.tokens.matrix <- model.tokens.dfm %>% as.matrix()
+
+model.tokens.df <- model.tokens.dfm %>% as.data.frame()
+
+# Create labels for model
+labels_pres <- c(rep("Obama", nrow(obama_tweets)), 
+                 rep("Trump", nrow(trump_tweets)))
+
+data_tweets <- cbind(model.tokens.df, "Which_President" = labels_pres) %>% 
+                mutate(Which_President = as.factor(Which_President))
+```
+
+```{r echo=F}
+kable(head(data_tweets[c(1:3, 300:302), c(1,3,30,20, 100, 300,12, ncol(data_tweets))]), caption="small subset of data frame: data_tweets", row.names = F)
+```
+
+```{r }
+nrow(data_tweets)
+ncol(data_tweets)
+nrow(filter(data_tweets, Which_President== "Trump"))
+nrow(filter(data_tweets, Which_President== "Obama"))
+```
+
+# Build Model with our feature matrix
+```{r}
+set.seed(123)
+# create partition
+inTrain <- createDataPartition(data_tweets$Which_President, 
+                               p = .90, list=FALSE)
+
+# Split the data:
+training <-  data_tweets %>% dplyr::slice(inTrain) 
+testing  <-  data_tweets %>% dplyr::slice(-inTrain)
+```
+
+```{r eval=F}
+# train model
+control <- trainControl(method = "cv", number = 5, 
+                        savePredictions = TRUE, classProbs = TRUE)
+
+xgGrid <- expand.grid(
+    nrounds   = c(50),
+    max_depth = c(2,3,4), 
+    eta       = c(.1, .2, .3, .4, .5),
+    gamma     = c(0.01),
+    colsample_bytree = c(0.75),
+    subsample = c(0.50),
+    min_child_weight = c(0))
+
+model_caret_1 <- Which_President ~ .
+
+# Train Model
+
+train_mod_xg <- caret::train(model_caret_1, data = training, 
+                             method="xgbTree", trControl=control, 
+                             tuneGrid = xgGrid) # our favourite, xgb
+
+predictions_xg <- predict(train_mod_xg, testing[, -ncol(testing)], type = "prob" )
+
+predictions_class_xg <- predict(train_mod_xg, testing[, -ncol(testing)])
+
+table(predictions_class_xg, testing$Which_President)
+roc(as.numeric(testing$Which_President), predictions_xg$Obama)
+```
+`system.time(train_model) = 25.8s`
+
+
+## Cross validation results (and problems with naive grid search)
+
+Imagine if we started at `shrinkage = .1` ...
+
+```{r, echo=F}
+plot1
+kable(train_mod_xg$bestTune, caption = "Best parameter choices for XGBoost", row.names = F)
+```
+
+### How many parameters to optmize?
+
+There are seven parameters with a varying range of levels, realistically we might want to try these levels:
+
+```{r }
+xgGrid <- expand.grid(
+    nrounds   = c(50, 150, 250, 350), 
+    max_depth = c(3, 6, 9, 12, 30, 40), 
+    eta       = c(.1, .2, .3, .4, .5),
+    gamma     = c(0.01, .1, 2),
+    colsample_bytree = c(0.75),
+    subsample = c(0.50),
+    min_child_weight = c(0))
+```
+
+That is tuning a model: $4*6*5*...$, if `proc time` > a few hours this problem blows up.
+
+* Options to deal with compute time:
+    + train on Cloud
+    + find more grad students
+    + ... Bayesian Optimization
+
+# Bayesian Optimization
+
+Useful for black box optimization. Since we don't know the objective function cannot use our regular methods (EM, NR). We'll set a prior over what kind of function we think it might look like: smooth, high variance, etc. (the bayesian part) and we'll optmize over where to explore next.
+
+### Key Points:
+
+* Have unkown objective function want to maximize/minimize (could be RMSE, accuracy)
+* Set Prior distribution on this function (gaussian process)
+* Explore regions with high uncertainty - exploit regions with high (predicted) objective function
+
+## Some basics:
+
+A Gaussian process is... 
+
+>a collection of random variables, any finite number of which have a joint Gaussian distribution (Rasmussen, 2006)
+
+$$
+m(x) = E[f(x)] \\
+k(x, x') = E[(f(x)-m(x))\ (f(x') - m(x'))]
+\\
+$$
+
+Then our GP is defined:
+
+$$
+f(x) \sim GP(m(x), \ k(x, x')) \ \ \text{}
+$$
+Where its common to let m(x) = 0. The standard covariance function k is often defined as $k(x_i, x_j) = \exp\big\{ -\frac{1}{2} (x_i - x_j)^2\big\}$ called the squared exponential and we'll define it here as K1:
+
+```{r }
+K1 <- function(s,t) return(exp(-16*(s-t)^2))
+```
+
+We'll setup our posterior predictive GP as follows: we sample our objective function $D_{1:t} = (x_{1:t}, \ y_{1:t})$ and combine it with our prior $f$ to get $P(f \ |D_{1:t})$ $\propto$ $P(D_{t:1} \ | \ f) \ P( \ f \)$
+
+GP's have nice properties, since they're gaussian, if we have evaulated our function with parameter values (assume $\theta = \text{our hyperparameter} = x$) $\{x{1:t}, \ f_{1:t}\}$ then our next parameter value $x_{t+1}$ evaluated at $f_{t+1}=f(x{t+1})$ we know:
+
+$$
+\textbf{K} = 
+\begin{bmatrix}
+ k(x_{1}, \ x_{1}) & ... &  k(x_{1}, \ x_{t}) \\
+ ... & ... & ...\\
+ k(x_{t}, \ x_{1}) & ... &  k(x_{t}, \ x_{t})
+\end{bmatrix}
+$$
+
+Then it follows: 
+
+$$
+\begin{pmatrix}
+\bf{f_{1:t}} \\
+f_{t+1}
+\end{pmatrix}
+\sim
+N\Big( \bf{0}, \ 
+\begin{bmatrix}
+\bf{K} & \bf{k} \\
+\bf{k}^T & k(x_{t+1}, \ x_{t+1})
+\end{bmatrix}
+$$
+
+here $\bf{k}$ = $[k(x_{t+1}, x_1), k(x_{t+1}, x_2), ..., \ k(x_{t+1}, x_t)]$ leading to our predictive disribution:
+
+$$
+P(f_{t+1} | D_{1:t}) = N(\mu_t(x_{t+1}), \ \sigma^2_t(x_{t+1}))
+$$
+
+where the mean and variance can be worked out:
+
+$$
+\mu_t(x_{t+1}) = \bf{k}\bf{K}^{-1}\bf{f}_{1:t} \\
+\sigma^2_t(x_{t+1}) = k(x_{t+1}, x_{t+1}) - k_{t+1}(K^{-1})k_{t+1}
+$$
+
+>See chapter 2 Rasmussen for full details
+
+
+## Quick example
+
+```{r eval=F}
+t <- seq(from = 0, to = 1, length.out = 1000) # x to sample from
+#compute covariance matrix
+Sigma <- sapply(t, function(s1) {
+    sapply(t, function(s2) {
+      K1(s1, s2)
+    })
+  })
+
+path <- mvrnorm(mu = rep(0, times = 1000), Sigma = Sigma) 
+x   <- data.frame("t" = t, "xt" = path, "label"= rep("x", 1000))
+```
+
+
+
+```{r echo=F, message=F, eval=F}
+t <- seq(from = 0, to = 1, length.out = 1000) # x to sample from
+#compute covariance matrix
+Sigma <- sapply(t, function(s1) {
+    sapply(t, function(s2) {
+      K1(s1, s2)
+    })
+  })
+
+path <- mvrnorm(mu = rep(0, times = 1000), Sigma = Sigma) 
+x   <- data.frame("t" = t, "xt" = path, "label"= rep("x", 1000))
+path <- mvrnorm(mu = rep(0, times = 1000), Sigma = Sigma) 
+b   <- data.frame("t" = t, "xt" = path, "label"= rep("b", 1000))
+
+path <- mvrnorm(mu = rep(0, times = 1000), Sigma = Sigma) 
+c   <- data.frame("t" = t, "xt" = path, "label"= rep("c", 1000))
+
+plot_data1 <- rbind(x, b, c)
+```
+
+```{r message=F, echo=F}
+ggplot(plot_data1, aes(x=t, y=xt)) + geom_smooth(aes(color=label)) + 
+  xlab("Theta") + ylab("Objective Value") 
+```
+
+
+```{r message=F, echo=F}
+ggplot(plot_data1, aes(x=t, y=xt)) + geom_smooth(aes(color=label)) + 
+  xlab("Theta") + ylab("Objective Value") + geom_point(aes(y=.43, x=0.74674675))
+```
+
+```{r message=F, echo=F}
+ggplot(plot_data1 %>% filter(label %in% c("x", "c")), aes(x=t, y=xt)) + geom_smooth(aes(color=label)) + 
+  xlab("Theta") + ylab("Objective Value") + geom_point(aes(y=.43, x=0.74674675))
+```
+
+
+## Implementing Bayesian Optimization
+
+
+
+
+```{r eval=F}
+training_xg <- training %>% dplyr::select(-Which_President)
+dtrain <- xgb.DMatrix(as.matrix(training_xg), label = as.matrix(as.numeric(training$Which_President) -1) )
+
+cv_folds <- KFold(training$Which_President, nfolds = 5,
+                  stratified = TRUE, seed = 0)
+
+xgb_cv_bayes <- function(max.depth, eta) {
+
+  cv   <- xgb.cv(params = list(booster = "gbtree", eta = eta,
+                             max_depth = max.depth,
+                             min_child_weight = 0,
+                             subsample = .5, colsample_bytree = 0.3,
+                             lambda = 1, alpha = 0,
+                             objective = "binary:logistic",
+                             eval_metric = "auc"),
+               data = dtrain, nround = 50,
+               folds = cv_folds, prediction = TRUE, showsd = TRUE,
+               early_stopping_rounds = 5, maximize = TRUE, verbose = 0)
+  
+  list(Score = cv$evaluation_log[, max(test_auc_mean)], Pred = cv$pred)
+}
+
+OPT_Res <- BayesianOptimization(xgb_cv_bayes, 
+                                bounds = list(max.depth = c(3L, 5L),
+                                              eta = c(0.1, 0.5)),
+                                init_grid_dt = NULL, init_points = 10, n_iter = 20,
+                                acq = "ucb", kappa = 2.576, eps = 0.0,
+                                verbose = TRUE)
+
+```
+
+## Results from bayesopt
+
+ Best Parameters Found: 
+max.depth = 4.0000	eta = 0.3325	Value = 0.8003
+
+```{r eval=F}
+control <- trainControl(method = "cv", number = 5, 
+                        savePredictions = TRUE, classProbs = TRUE)
+
+xgGrid_bayes <- expand.grid(
+    nrounds   = c(50),
+    max_depth = 4, 
+    eta       = c(.3325),
+    gamma     = c(0.01),
+    colsample_bytree = c(0.75),
+    subsample = c(0.50),
+    min_child_weight = c(0))
+
+model_caret_1 <- Which_President ~ .
+
+# Train Model
+train_mod_bayes <- caret::train(model_caret_1, data = training, 
+                             method="xgbTree", trControl=control, 
+                             tuneGrid = xgGrid_bayes) # same but now with optimized
+
+predictions_xgb_bayes <- predict(train_mod_bayes, testing[, -ncol(testing)], type = "prob" )
+
+predictions_class_xbg_bayes <- predict(train_mod_bayes, testing[, -ncol(testing)])
+```
+
+
+```{r }
+# bayesian optimization
+
+table(predictions_class_xbg_bayes, testing$Which_President)
+roc(as.numeric(testing$Which_President), predictions_xgb_bayes$Obama)$auc  
+```
+
+```{r }
+table(predictions_class_xg, testing$Which_President)
+roc(as.numeric(testing$Which_President), predictions_xg$Obama)$auc
+```
+
+
+
+
+
+
+
+
